@@ -7,6 +7,8 @@ import (
 	"os"
 	"testing"
 
+	"github.com/jackc/pgx/v4"
+
 	"github.com/cloudquery/cq-provider-sdk/cqproto"
 	"github.com/cloudquery/cq-provider-sdk/logging"
 	"github.com/cloudquery/cq-provider-sdk/provider"
@@ -16,7 +18,6 @@ import (
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/hcl/v2/gohcl"
 	"github.com/hashicorp/hcl/v2/hclwrite"
-	"github.com/jackc/pgx/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tmccombs/hcl2json/convert"
@@ -28,6 +29,8 @@ type ResourceTestData struct {
 	Resources      []string
 	Configure      func(logger hclog.Logger, data interface{}) (schema.ClientMeta, error)
 	SkipEmptyJsonB bool
+	AtLeastOne     map[string][][]string
+	Optional       map[string][]string
 }
 
 func TestResource(t *testing.T, providerCreator func() *provider.Provider, resource ResourceTestData) {
@@ -64,7 +67,8 @@ func TestResource(t *testing.T, providerCreator func() *provider.Provider, resou
 
 	err = testProvider.FetchResources(context.Background(), &cqproto.FetchResourcesRequest{Resources: []string{findResourceFromTableName(resource.Table, testProvider.ResourceMap)}}, fakeResourceSender{})
 	assert.Nil(t, err)
-	verifyNoEmptyColumns(t, resource, conn)
+	verifyAtLeastOne(t, resource, conn)
+	verifyOptionalQuery(t, resource, conn)
 }
 
 func findResourceFromTableName(table *schema.Table, tables map[string]*schema.Table) string {
@@ -107,42 +111,61 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-func verifyNoEmptyColumns(t *testing.T, tc ResourceTestData, conn pgxscan.Querier) {
-	// Test that we don't have missing columns and have exactly one entry for each table
+var selectColumnsIsNull, _ = NewQueryTemplate(
+	`select * from {{.Table}} where {{.Columns | arrprintf "%v is null" | join " and "}};`,
+)
+
+func verifyAtLeastOne(t *testing.T, tc ResourceTestData, conn pgxscan.Querier) {
 	for _, table := range getTablesFromMainTable(tc.Table) {
-		query := fmt.Sprintf("select * FROM %s ", table)
-		rows, err := conn.Query(context.Background(), query)
-		if err != nil {
-			t.Fatal(err)
-		}
-		count := 0
-		for rows.Next() {
-			count += 1
-		}
-		if count < 1 {
-			t.Fatalf("expected to have at least 1 entry at table %s got %d", table, count)
-		}
-		if tc.SkipEmptyJsonB {
-			continue
-		}
-		query = fmt.Sprintf("select t.* FROM %s as t WHERE to_jsonb(t) = jsonb_strip_nulls(to_jsonb(t))", table)
-		rows, err = conn.Query(context.Background(), query)
-		if err != nil {
-			t.Fatal(err)
-		}
-		count = 0
-		for rows.Next() {
-			count += 1
-		}
-		if count < 1 {
-			t.Fatalf("row at table %s has an empty column", table)
+		for _, columns := range tc.AtLeastOne[table.Name] {
+			rows, err := selectColumnsIsNull.Query(conn, map[string]interface{}{"Table": table.Name, "Columns": columns})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// if response is not empty
+			if rows.Next() {
+				t.Fatal("oneof test failed")
+			}
 		}
 	}
 }
 
-func getTablesFromMainTable(table *schema.Table) []string {
-	var res []string
-	res = append(res, table.Name)
+func verifyOptionalQuery(t *testing.T, tc ResourceTestData, conn pgxscan.Querier) {
+	for _, table := range getTablesFromMainTable(tc.Table) {
+		columnsMap := map[string]struct{}{}
+		for _, column := range table.Columns {
+			columnsMap[column.Name] = struct{}{}
+		}
+
+		for _, column := range tc.Optional[table.Name] {
+			delete(columnsMap, column)
+		}
+
+		for _, columns := range tc.AtLeastOne[table.Name] {
+			for _, column := range columns {
+				delete(columnsMap, column)
+			}
+		}
+
+		columns := make([]string, 0, len(columnsMap))
+		for k := range columnsMap {
+			columns = append(columns, k)
+		}
+
+		rows, err := selectColumnsIsNull.Query(conn, map[string]interface{}{"Table": table.Name, "Columns": columns})
+		if err != nil {
+			t.Fatal(err)
+		}
+		// if response is not empty
+		if rows.Next() {
+			t.Fatal("optional test failed")
+		}
+	}
+}
+
+func getTablesFromMainTable(table *schema.Table) []*schema.Table {
+	var res []*schema.Table
+	res = append(res, table)
 	for _, t := range table.Relations {
 		res = append(res, getTablesFromMainTable(t)...)
 	}
