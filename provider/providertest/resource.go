@@ -28,7 +28,10 @@ type ResourceTestData struct {
 	Resources      []string
 	Configure      func(logger hclog.Logger, data interface{}) (schema.ClientMeta, error)
 	SkipEmptyJsonB bool
+	Verifiers      []Verifier
 }
+
+type Verifier func(t *testing.T, conn pgxscan.Querier)
 
 func TestResource(t *testing.T, providerCreator func() *provider.Provider, resource ResourceTestData) {
 	if err := faker.SetRandomMapAndSliceMinSize(1); err != nil {
@@ -64,7 +67,9 @@ func TestResource(t *testing.T, providerCreator func() *provider.Provider, resou
 
 	err = testProvider.FetchResources(context.Background(), &cqproto.FetchResourcesRequest{Resources: []string{findResourceFromTableName(resource.Table, testProvider.ResourceMap)}}, fakeResourceSender{})
 	assert.Nil(t, err)
-	verifyNoEmptyColumns(t, resource, conn)
+	for _, verifier := range resource.Verifiers {
+		verifier(t, conn)
+	}
 }
 
 func findResourceFromTableName(table *schema.Table, tables map[string]*schema.Table) string {
@@ -105,46 +110,4 @@ func getEnv(key, fallback string) string {
 		return value
 	}
 	return fallback
-}
-
-func verifyNoEmptyColumns(t *testing.T, tc ResourceTestData, conn pgxscan.Querier) {
-	// Test that we don't have missing columns and have exactly one entry for each table
-	for _, table := range getTablesFromMainTable(tc.Table) {
-		query := fmt.Sprintf("select * FROM %s ", table)
-		rows, err := conn.Query(context.Background(), query)
-		if err != nil {
-			t.Fatal(err)
-		}
-		count := 0
-		for rows.Next() {
-			count += 1
-		}
-		if count < 1 {
-			t.Fatalf("expected to have at least 1 entry at table %s got %d", table, count)
-		}
-		if tc.SkipEmptyJsonB {
-			continue
-		}
-		query = fmt.Sprintf("select t.* FROM %s as t WHERE to_jsonb(t) = jsonb_strip_nulls(to_jsonb(t))", table)
-		rows, err = conn.Query(context.Background(), query)
-		if err != nil {
-			t.Fatal(err)
-		}
-		count = 0
-		for rows.Next() {
-			count += 1
-		}
-		if count < 1 {
-			t.Fatalf("row at table %s has an empty column", table)
-		}
-	}
-}
-
-func getTablesFromMainTable(table *schema.Table) []string {
-	var res []string
-	res = append(res, table.Name)
-	for _, t := range table.Relations {
-		res = append(res, getTablesFromMainTable(t)...)
-	}
-	return res
 }
