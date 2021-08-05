@@ -329,7 +329,7 @@ func verifyRelations(relations []*ResourceIntegrationVerification, parentId inte
 		for _, e := range data {
 			id, ok := e["id"]
 			if !ok {
-				return fmt.Errorf("failed to get parent id for %s", relation.Name)
+				return nil
 			}
 			if err = verifyRelations(relation.Relations, id, relation.Name, conn); err != nil {
 				return fmt.Errorf("%s id: %v -> %w", relation.Name, id, err)
