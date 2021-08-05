@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"reflect"
 	"runtime/debug"
 	"sync/atomic"
 
@@ -19,23 +20,26 @@ type ClientMeta interface {
 
 // ExecutionData marks all the related execution info passed to TableResolver and ColumnResolver giving access to the Runner's meta
 type ExecutionData struct {
-	// The table this execution is associated with
+	// Table this execution is associated with
 	Table *Table
 	// Database connection to insert data into
 	Db Database
 	// Logger associated with this execution
 	Logger hclog.Logger
-	// Column is set if execution is passed to ColumnResolver
-	Column *Column
+	// disableDelete allows to disable deletion of table data for this execution
+	disableDelete bool
+	// extraFields to be passed to each created resource in the execution
+	extraFields map[string]interface{}
 }
 
 // NewExecutionData Create a new execution data
-func NewExecutionData(db Database, logger hclog.Logger, table *Table) ExecutionData {
+func NewExecutionData(db Database, logger hclog.Logger, table *Table, disableDelete bool, extraFields map[string]interface{}) ExecutionData {
 	return ExecutionData{
-		Table:  table,
-		Db:     db,
-		Logger: logger,
-		Column: nil,
+		Table:         table,
+		Db:            db,
+		Logger:        logger,
+		disableDelete: disableDelete,
+		extraFields:   extraFields,
 	}
 }
 
@@ -64,20 +68,37 @@ func (e ExecutionData) ResolveTable(ctx context.Context, meta ClientMeta, parent
 
 func (e ExecutionData) WithTable(t *Table) ExecutionData {
 	return ExecutionData{
-		Table:  t,
-		Db:     e.Db,
-		Logger: e.Logger,
+		Table:         t,
+		Db:            e.Db,
+		Logger:        e.Logger,
+		disableDelete: e.disableDelete,
+		extraFields:   e.extraFields,
 	}
+}
+
+func (e ExecutionData) truncateTable(ctx context.Context, client ClientMeta, parent *Resource) error {
+	if e.Table.DeleteFilter == nil {
+		return nil
+	}
+	if e.disableDelete && !e.Table.AlwaysDelete {
+		client.Logger().Debug("skipping table truncate", "table", e.Table.Name)
+		return nil
+	}
+	// Delete previous fetch
+	client.Logger().Debug("cleaning table previous fetch", "table", e.Table.Name, "always_delete", e.Table.AlwaysDelete)
+	if err := e.Db.Delete(ctx, e.Table, e.Table.DeleteFilter(client, parent)); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (e ExecutionData) callTableResolve(ctx context.Context, client ClientMeta, parent *Resource) (uint64, error) {
 
-	if parent == nil && e.Table.DeleteFilter != nil {
-		// Delete previous fetch
-		if err := e.Db.Delete(ctx, e.Table, e.Table.DeleteFilter(client)); err != nil {
-			client.Logger().Debug("cleaning table previous fetch", "table", e.Table.Name)
-			return 0, err
-		}
+	if e.Table.Resolver == nil {
+		return 0, fmt.Errorf("table %s missing resolver, make sure table implements the resolver", e.Table.Name)
+	}
+	if err := e.truncateTable(ctx, client, parent); err != nil {
+		return 0, err
 	}
 
 	res := make(chan interface{})
@@ -86,11 +107,10 @@ func (e ExecutionData) callTableResolve(ctx context.Context, client ClientMeta, 
 		defer func() {
 			if r := recover(); r != nil {
 				fmt.Fprintf(os.Stderr, "Fetch task exited with panic:\n%s\n", debug.Stack())
-				e.Logger.Error("Fetch task exited with panic", e.Table.Name, string(debug.Stack()))
+				e.Logger.Error("Fetch task exited with panic", "table", e.Table.Name, "stack", string(debug.Stack()))
 			}
 			close(res)
 		}()
-
 		resolverErr = e.Table.Resolver(ctx, client, parent, res)
 	}()
 
@@ -118,18 +138,26 @@ func (e ExecutionData) callTableResolve(ctx context.Context, client ClientMeta, 
 }
 
 func (e ExecutionData) resolveResources(ctx context.Context, meta ClientMeta, parent *Resource, objects []interface{}) error {
-	var resources = make([]*Resource, len(objects))
+	var resources = make(Resources, len(objects))
 	for i, o := range objects {
-		resources[i] = NewResourceData(e.Table, parent, o)
+		resources[i] = NewResourceData(e.Table, parent, o, e.extraFields)
+		// Before inserting resolve all table column resolvers
 		if err := e.resolveResourceValues(ctx, meta, resources[i]); err != nil {
+			e.Logger.Error("failed to resolve resource values", "error", err)
 			return err
 		}
 	}
 
-	// Before inserting resolve all table column resolvers
-	if err := e.Db.Insert(ctx, e.Table, resources); err != nil {
-		e.Logger.Error("failed to insert to db", "error", err)
-		return err
+	// only top level tables should cascade, disable delete is turned on.
+	// if we didn't disable delete all data should be wiped before resolve)
+	shouldCascade := parent == nil && e.disableDelete
+	if err := e.Db.CopyFrom(ctx, resources, shouldCascade, e.extraFields); err != nil {
+		e.Logger.Warn("failed copy-from to db", "error", err)
+		// fallback insert, copy from sometimes does problems so we fall back with insert
+		if err := e.Db.Insert(ctx, e.Table, resources); err != nil {
+			e.Logger.Error("failed insert to db", "error", err)
+			return err
+		}
 	}
 
 	// Finally resolve relations of each resource
@@ -151,11 +179,16 @@ func (e ExecutionData) resolveResourceValues(ctx context.Context, meta ClientMet
 		return err
 	}
 	// call PostRowResolver if defined after columns have been resolved
-	if resource.table.PostResourceResolver == nil {
-		return nil
+	if resource.table.PostResourceResolver != nil {
+		if err := resource.table.PostResourceResolver(ctx, meta, resource); err != nil {
+			return err
+		}
 	}
-	if err := resource.table.PostResourceResolver(ctx, meta, resource); err != nil {
-		return err
+	// Finally generate cq_id for resource
+	for _, c := range GetDefaultSDKColumns() {
+		if err := c.Resolver(ctx, meta, resource, c); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -182,4 +215,27 @@ func (e ExecutionData) resolveColumns(ctx context.Context, meta ClientMeta, reso
 		}
 	}
 	return nil
+}
+
+func interfaceSlice(slice interface{}) []interface{} {
+	// if value is nil return nil
+	if slice == nil {
+		return nil
+	}
+	s := reflect.ValueOf(slice)
+	// Keep the distinction between nil and empty slice input
+	if s.Kind() == reflect.Ptr && s.Elem().Kind() == reflect.Slice && s.Elem().IsNil() {
+		return nil
+	}
+	if s.Kind() != reflect.Slice {
+		return []interface{}{slice}
+	}
+
+	ret := make([]interface{}, s.Len())
+
+	for i := 0; i < s.Len(); i++ {
+		ret[i] = s.Index(i).Interface()
+	}
+
+	return ret
 }

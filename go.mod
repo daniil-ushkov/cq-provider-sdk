@@ -7,6 +7,7 @@ require (
 	github.com/cloudquery/faker/v3 v3.7.4
 	github.com/cockroachdb/cockroach-go/v2 v2.1.1 // indirect
 	github.com/creasty/defaults v1.5.1
+	github.com/doug-martin/goqu/v9 v9.13.0
 	github.com/fatih/color v1.10.0 // indirect
 	github.com/georgysavva/scany v0.2.8
 	github.com/go-test/deep v1.0.7
@@ -26,13 +27,15 @@ require (
 	github.com/jhump/protoreflect v1.8.2 // indirect
 	github.com/lib/pq v1.10.1 // indirect
 	github.com/mitchellh/go-testing-interface v1.14.1 // indirect
+	github.com/mitchellh/hashstructure v1.1.0
 	github.com/modern-go/reflect2 v1.0.1
 	github.com/oklog/run v1.1.0 // indirect
 	github.com/stretchr/objx v0.3.0 // indirect
 	github.com/stretchr/testify v1.7.0
 	github.com/thoas/go-funk v0.8.1-0.20210502090430-efae847b30ab
 	github.com/tmccombs/hcl2json v0.3.3
-	github.com/zclconf/go-cty v1.8.3 // indirect
+	github.com/vmihailenco/msgpack/v5 v5.3.4
+	github.com/zclconf/go-cty v1.9.0 // indirect
 	golang.org/x/crypto v0.0.0-20210506145944-38f3c27a63bf // indirect
 	golang.org/x/net v0.0.0-20210510120150-4163338589ed // indirect
 	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
