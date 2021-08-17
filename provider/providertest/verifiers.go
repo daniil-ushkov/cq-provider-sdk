@@ -71,3 +71,19 @@ func VerifyOneOf(table string, oneof ...string) Verifier {
 		rows.Close()
 	}
 }
+
+func VerifyAtLeastOneRow(table string) Verifier {
+	return func(t *testing.T, conn pgxscan.Querier) {
+		rows, err := conn.Query(context.Background(), fmt.Sprintf("select * from %s;", table))
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if !rows.Next() {
+			t.Fatal("VerifyAtLeastOneRow failed")
+		}
+
+		rows.Close()
+	}
+}
